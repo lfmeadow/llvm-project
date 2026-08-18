@@ -1883,6 +1883,15 @@ struct Attributor {
     InvokeWithDeadSuccessor.insert(&II);
   }
 
+  /// Record that an indirect call in \p Caller was replaced by direct calls,
+  /// which may have closed a call graph cycle and made `norecurse` false for
+  /// the functions in it. The attribute is dropped in the cleanup phase; it
+  /// cannot be dropped during manifestation because the abstract attribute
+  /// holding it may be manifested afterwards and put it back.
+  void recordIndirectCallSpecialization(Function &Caller) {
+    SpecializedIndirectCallers.insert(&Caller);
+  }
+
   /// Record that \p I is deleted after information was manifested. This also
   /// triggers deletion of trivially dead istructions.
   void deleteAfterManifest(Instruction &I) { ToBeDeletedInsts.insert(&I); }
@@ -2589,6 +2598,9 @@ private:
   SmallSetVector<BasicBlock *, 8> ToBeDeletedBlocks;
   SmallSetVector<WeakVH, 8> ToBeDeletedInsts;
   ///}
+
+  /// Functions in which an indirect call was replaced by direct calls.
+  SmallSetVector<Function *, 8> SpecializedIndirectCallers;
 
   /// Container with all the query AAs that requested an update via
   /// registerForUpdate.
