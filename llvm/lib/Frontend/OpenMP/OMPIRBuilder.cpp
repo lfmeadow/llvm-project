@@ -8600,8 +8600,16 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createTargetInit(
   bool NeedsMainThreadWarp =
       Attrs.ExecFlags != omp::OMP_TGT_EXEC_MODE_SPMD &&
       Attrs.ExecFlags != omp::OMP_TGT_EXEC_MODE_SPMD_NO_LOOP;
-  if (MaxThreadsVal > 0 && NeedsMainThreadWarp && hasGridValue(T))
-    MaxThreadsVal += getGridValue(T, Kernel).GV_Warp_Size;
+  if (MaxThreadsVal > 0 && NeedsMainThreadWarp && hasGridValue(T)) {
+    // The extra warp cannot push the block past what the target allows: a bound
+    // the subtarget rejects is discarded whole rather than clamped, which would
+    // cost the kernel the bound entirely and leave it with the default. At the
+    // maximum the last warp is taken from the workers rather than added to the
+    // block.
+    const omp::GV &GridValue = getGridValue(T, Kernel);
+    MaxThreadsVal = std::min(MaxThreadsVal + int32_t(GridValue.GV_Warp_Size),
+                             int32_t(GridValue.GV_Max_WG_Size));
+  }
 
   if (MaxThreadsVal > 0)
     writeThreadBoundsForKernel(T, *Kernel, Attrs.MinThreads, MaxThreadsVal);
