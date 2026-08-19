@@ -2,9 +2,6 @@
 ; RUN: opt -passes=openmp-opt -S < %s | FileCheck %s --check-prefix=CAP3
 ; RUN: opt -passes=openmp-opt -openmp-opt-max-indirect-call-specializations=4 -S < %s | FileCheck %s --check-prefix=CAP4
 ; RUN: opt -passes=openmp-opt -openmp-opt-max-indirect-call-specializations=0 -S < %s | FileCheck %s --check-prefix=CAP0
-; XFAIL: *
-; Baseline branch only: this describes behaviour no fix has been landed for yet.
-
 ; The cap is on the number of possible callees, so it is a property of the call
 ; site and not of the module: at the default of 3, @three gets its if-cascade and
 ; @four keeps its indirect call. Raising the cap to 4 specializes both, and 0
