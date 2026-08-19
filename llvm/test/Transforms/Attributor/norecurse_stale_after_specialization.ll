@@ -1,7 +1,5 @@
 ; RUN: opt -passes='cgscc(function-attrs),rpo-function-attrs,attributor' \
 ; RUN:     -attributor-assume-closed-world -S < %s | FileCheck %s
-; XFAIL: *
-; Baseline branch only: this describes behaviour no fix has been landed for yet.
 
 ; Nothing in this module marks @dispatcher norecurse. rpo-function-attrs adds it:
 ; addNoRecurseAttrsTopDown only walks a function's uses, never its body, so a

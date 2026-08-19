@@ -14,8 +14,6 @@
 
 // REQUIRES: gpu
 
-// XFAIL: *
-// Baseline branch only: this describes behaviour no fix has been landed for yet.
 
 #include <stdio.h>
 

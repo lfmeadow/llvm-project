@@ -58,6 +58,7 @@
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
@@ -198,6 +199,21 @@ static const omp::GV &getGridValue(const Triple &T, Function *Kernel) {
     StringRef Features =
         Kernel->getFnAttribute("target-features").getValueAsString();
     if (Features.count("+wavefrontsize64"))
+      return omp::getAMDGPUGridValues<64>();
+    if (Features.count("+wavefrontsize32"))
+      return omp::getAMDGPUGridValues<32>();
+
+    // Clang does not put a wavefront size in target-features for OpenMP device
+    // kernels, so fall back to what the processor supports. Only targets that
+    // can run wave32 do; the rest are wave64, and answering 32 for those makes
+    // every warp-size-derived value wrong by a factor of two. An unrecognized
+    // or absent processor tells us nothing, so leave that case alone.
+    StringRef CPU = Kernel->getFnAttribute("target-cpu").getValueAsString();
+    AMDGPU::GPUKind Kind = AMDGPU::parseArchAMDGCN(CPU);
+    if (Kind == AMDGPU::GK_NONE)
+      Kind = AMDGPU::getGPUKindFromSubArch(T.getSubArch());
+    if (Kind != AMDGPU::GK_NONE &&
+        !(AMDGPU::getArchAttrAMDGCN(Kind) & AMDGPU::FEATURE_WAVE32))
       return omp::getAMDGPUGridValues<64>();
     return omp::getAMDGPUGridValues<32>();
   }
@@ -8572,6 +8588,20 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createTargetInit(
       MaxThreadsVal = Attrs.MinThreads;
     }
   }
+
+  // A kernel that uses the generic state machine runs the user's threads on
+  // every warp but the last, which is reserved for the main thread. The block
+  // therefore has to be one warp larger than the thread limit the user asked
+  // for: both the device runtime's getMaxTeamThreads and the state machine
+  // built by OpenMPOpt derive the team size as BlockSize - WarpSize, and a
+  // block that is not larger than a warp leaves them no threads to run on. The
+  // bound written here is what the backend allocates resources for and what the
+  // plugin launches, so it is the one place the extra warp can be added.
+  bool NeedsMainThreadWarp =
+      Attrs.ExecFlags != omp::OMP_TGT_EXEC_MODE_SPMD &&
+      Attrs.ExecFlags != omp::OMP_TGT_EXEC_MODE_SPMD_NO_LOOP;
+  if (MaxThreadsVal > 0 && NeedsMainThreadWarp && hasGridValue(T))
+    MaxThreadsVal += getGridValue(T, Kernel).GV_Warp_Size;
 
   if (MaxThreadsVal > 0)
     writeThreadBoundsForKernel(T, *Kernel, Attrs.MinThreads, MaxThreadsVal);

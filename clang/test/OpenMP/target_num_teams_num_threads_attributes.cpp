@@ -85,7 +85,11 @@ void threads_and_teams() {
 // CHECK:      "omp_target_num_teams"="33"
 // CHECK:      "omp_target_num_teams"="44"
 
-// CHECK:      "omp_target_thread_limit"="22"
+// A generic mode kernel reserves one warp for the main thread, so its bound is
+// the thread_limit clause plus the warp size, which differs across the targets
+// this test runs on. The kernels below are SPMD and keep the value the program
+// asked for.
+// CHECK:      "omp_target_thread_limit"="{{54|86}}"
 
 // CHECK:      "omp_target_thread_limit"="11"
 
