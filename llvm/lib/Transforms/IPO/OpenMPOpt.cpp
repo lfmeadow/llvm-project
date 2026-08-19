@@ -2262,7 +2262,7 @@ bool OpenMPOpt::rewriteDeviceCodeStateMachine() {
 
     auto *ID = new GlobalVariable(
         M, Int8Ty, /* isConstant */ true, GlobalValue::PrivateLinkage,
-        UndefValue::get(Int8Ty), F->getName() + ".ID");
+        PoisonValue::get(Int8Ty), F->getName() + ".ID");
 
     for (Use *U : ToBeReplacedStateMachineUses)
       U->set(ConstantExpr::getPointerBitCastOrAddrSpaceCast(
@@ -4102,7 +4102,7 @@ struct AAKernelInfoFunction : AAKernelInfo {
         // value.
         auto *SharedMem = new GlobalVariable(
             M, I.getType(), /* IsConstant */ false,
-            GlobalValue::InternalLinkage, UndefValue::get(I.getType()),
+            GlobalValue::InternalLinkage, PoisonValue::get(I.getType()),
             sanitizeForGlobalName(
                 (I.getName() + ".guarded.output.alloc").str()),
             nullptr, GlobalValue::NotThreadLocal,
