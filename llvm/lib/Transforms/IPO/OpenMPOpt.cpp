@@ -51,6 +51,7 @@
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -553,6 +554,53 @@ struct OMPInformationCache : public InformationCache {
     collectUses(RFI, /*CollectStats*/ false);
   }
 
+  /// Attach !callback metadata to a runtime function that takes one, so that
+  /// the Attributor sees the edge from the runtime call to the callback and
+  /// AAKernelInfo can look inside it. The runtime declares these functions
+  /// without the metadata, so OpenMPOpt supplies it from the table in
+  /// OMPKinds.def.
+  void setCallbackMetadata(Function *F, unsigned ArgNo, ArrayRef<int> Indices,
+                           bool IsVarArg) {
+    if (!F || F->hasMetadata(LLVMContext::MD_callback))
+      return;
+
+    LLVMContext &Ctx = F->getContext();
+    MDBuilder MDB(Ctx);
+    F->addMetadata(LLVMContext::MD_callback,
+                   *MDNode::get(Ctx, {MDB.createCallbackEncoding(ArgNo, Indices,
+                                                                 IsVarArg)}));
+  }
+
+  /// The callback a runtime function was handed, if it is one we can analyze.
+  /// Returns null when the call takes no callback, or when the callback is not
+  /// a definition this module can see, in which case its contents are unknown
+  /// and callers have to stay conservative.
+  static Function *getAnalyzableCallback(const CallBase &CB) {
+    Function *Callee = CB.getCalledFunction();
+    if (!Callee)
+      return nullptr;
+    MDNode *CallbackMD = Callee->getMetadata(LLVMContext::MD_callback);
+    if (!CallbackMD || CallbackMD->getNumOperands() == 0)
+      return nullptr;
+    // TODO: A runtime function with more than one callback would need each of
+    // them checked; none of the ones in the table have more than one.
+    auto *Encoding = dyn_cast<MDNode>(CallbackMD->getOperand(0));
+    if (!Encoding || Encoding->getNumOperands() == 0)
+      return nullptr;
+    auto *ArgNoMD = dyn_cast<ConstantAsMetadata>(Encoding->getOperand(0));
+    if (!ArgNoMD)
+      return nullptr;
+    uint64_t ArgNo =
+        cast<ConstantInt>(ArgNoMD->getValue())->getLimitedValue(UINT64_MAX);
+    if (ArgNo >= CB.arg_size())
+      return nullptr;
+    auto *Callback =
+        dyn_cast<Function>(CB.getArgOperand(ArgNo)->stripPointerCasts());
+    if (!Callback || Callback->isDeclaration())
+      return nullptr;
+    return Callback;
+  }
+
   // Helper function to recollect uses of all runtime functions.
   void recollectUses() {
     for (int Idx = 0; Idx < RFIs.size(); ++Idx)
@@ -636,6 +684,10 @@ struct OMPInformationCache : public InformationCache {
       });                                                                      \
     }                                                                          \
   }
+
+#define OMP_RTL_CB_INFO(_Enum, _Name, _ArgNo, _ArgIndices, _IsVarArg)          \
+  setCallbackMetadata(M.getFunction(_Name), _ArgNo, _ArgIndices, _IsVarArg);
+
 #include "llvm/Frontend/OpenMP/OMPKinds.def"
 
     // Remove the `noinline` attribute from `__kmpc`, `ompx::` and `omp_`
@@ -4828,6 +4880,24 @@ struct AAKernelInfoFunction : AAKernelInfo {
     bool AllSPMDStatesWereFixed = true;
     auto CheckCallInst = [&](Instruction &I) {
       auto &CB = cast<CallBase>(I);
+      // A runtime function that takes a callback runs the user's code inside
+      // it, so whatever the callback reaches this kernel reaches too. Fold the
+      // callback's state in; without this the call tells us nothing about the
+      // parallel regions on the other side of it.
+      if (Function *Callback = OMPInformationCache::getAnalyzableCallback(CB)) {
+        LLVM_DEBUG(dbgs() << TAG << "folding in callback "
+                          << Callback->getName() << " of " << CB << "\n");
+        if (auto *CallbackAA = A.getAAFor<AAKernelInfo>(
+                *this, IRPosition::function(*Callback), DepClassTy::OPTIONAL)) {
+          getState() ^= CallbackAA->getState();
+          AllSPMDStatesWereFixed &=
+              CallbackAA->SPMDCompatibilityTracker.isAtFixpoint();
+          AllParallelRegionStatesWereFixed &=
+              CallbackAA->ReachedKnownParallelRegions.isAtFixpoint();
+          AllParallelRegionStatesWereFixed &=
+              CallbackAA->ReachedUnknownParallelRegions.isAtFixpoint();
+        }
+      }
       auto *CBAA = A.getAAFor<AAKernelInfo>(
           *this, IRPosition::callsite_function(CB), DepClassTy::OPTIONAL);
       if (!CBAA)
@@ -5003,7 +5073,10 @@ struct AAKernelInfoCallSite : AAKernelInfo {
         // state based on the callee state in updateImpl.
         return;
       }
-      if (NumCallees > 1) {
+      // More than one callee normally means an indirect call we cannot resolve.
+      // A runtime function carrying !callback is the exception: the extra edge
+      // is the callback, which we analyze rather than give up on.
+      if (NumCallees > 1 && !Callee->hasMetadata(LLVMContext::MD_callback)) {
         indicatePessimisticFixpoint();
         return;
       }
@@ -5112,13 +5185,15 @@ struct AAKernelInfoCallSite : AAKernelInfo {
       case OMPRTL___kmpc_for_static_loop_8:
       case OMPRTL___kmpc_for_static_loop_8u:
         // Parallel regions might be reached by these calls, as they take a
-        // callback argument potentially containing arbitrary user-provided
-        // code.
-        ReachedUnknownParallelRegions.insert(&CB);
+        // callback argument containing user-provided code. When the callback is
+        // a definition we can see, AAKernelInfoFunction folds in its state and
+        // learns which regions those actually are; when it is not, we have to
+        // assume the worst.
+        if (!OMPInformationCache::getAnalyzableCallback(CB))
+          ReachedUnknownParallelRegions.insert(&CB);
         // TODO: The presence of these calls on their own does not prevent a
-        // kernel from being SPMD-izable. We mark it as such because we need
-        // further changes in order to also consider the contents of the
-        // callbacks passed to them.
+        // kernel from being SPMD-izable now that the callback is analyzed, but
+        // enabling that has regressed applications, so stay conservative.
         SPMDCompatibilityTracker.indicatePessimisticFixpoint();
         SPMDCompatibilityTracker.insert(&CB);
         break;
@@ -5173,7 +5248,9 @@ struct AAKernelInfoCallSite : AAKernelInfo {
         getState() = FnAA->getState();
         return ChangeStatus::CHANGED;
       }
-      if (NumCallees > 1)
+      // See the matching check in initialize: a !callback runtime function has
+      // a second call edge by construction, and it is one we can analyze.
+      if (NumCallees > 1 && !F->hasMetadata(LLVMContext::MD_callback))
         return indicatePessimisticFixpoint();
 
       CallBase &CB = cast<CallBase>(getAssociatedValue());
